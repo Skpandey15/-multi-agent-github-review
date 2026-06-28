@@ -1,0 +1,1047 @@
+{
+  "info": {
+    "name": "Multi-Agent GitHub Code Review & Auto-Fix System",
+    "description": "Complete Postman collection for the Multi-Agent GitHub Code Review & Auto-Fix System.\n\n**Base URL:** http://localhost:8081\n\n**6-Agent Pipeline:**\n1. Reader — clones repo, maps files\n2. Analyser (GPT-4o) — finds security & quality issues\n3. Critic (GPT-4o) — adversarially eliminates false positives\n4. Fixer (GPT-4o) — generates code patches\n5. PR Raiser — creates GitHub branch + pull request\n6. Notifier — persists findings to PostgreSQL + sends email\n\n**How to use:**\n1. Set the `baseUrl` collection variable (default: http://localhost:8081)\n2. Trigger a review via `POST /api/review/trigger`\n3. Copy the returned `runId` into the `runId` collection variable\n4. Poll `GET /api/review/status/{runId}` or watch Temporal UI at http://localhost:8080\n5. Query results via GraphQL at /graphiql",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_exporter_id": "multi-agent-review-v1"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8081",
+      "type": "string",
+      "description": "Base URL of the running application"
+    },
+    {
+      "key": "runId",
+      "value": "",
+      "type": "string",
+      "description": "UUID of the pipeline run — populated after triggering a review"
+    },
+    {
+      "key": "webhookSecret",
+      "value": "your_webhook_secret_here",
+      "type": "string",
+      "description": "GitHub webhook HMAC-SHA256 secret — must match GITHUB_WEBHOOK_SECRET in .env"
+    },
+    {
+      "key": "targetRepoUrl",
+      "value": "https://github.com/Skpandey15/auth-service-jwt.git",
+      "type": "string",
+      "description": "GitHub repository URL to review"
+    },
+    {
+      "key": "targetBranch",
+      "value": "main",
+      "type": "string",
+      "description": "Branch to review"
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Health & Status",
+      "description": "Verify the application is up and all dependencies are healthy before triggering a review.",
+      "item": [
+        {
+          "name": "Health Check",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/actuator/health",
+              "host": ["{{baseUrl}}"],
+              "path": ["actuator", "health"]
+            },
+            "description": "Spring Boot Actuator health endpoint. Returns UP when all components (DB, Temporal) are healthy.\n\n**Expected response:**\n```json\n{ \"status\": \"UP\" }\n```\n\nIf status is DOWN, check:\n- PostgreSQL: `docker compose ps postgres`\n- Temporal: `docker compose ps temporal`\n- App logs: `docker compose logs -f app`"
+          },
+          "response": [
+            {
+              "name": "All Healthy",
+              "status": "OK",
+              "code": 200,
+              "header": [{"key": "Content-Type", "value": "application/json"}],
+              "body": "{\n  \"status\": \"UP\",\n  \"components\": {\n    \"db\": { \"status\": \"UP\", \"details\": { \"database\": \"PostgreSQL\", \"validationQuery\": \"isValid()\" } },\n    \"diskSpace\": { \"status\": \"UP\" },\n    \"ping\": { \"status\": \"UP\" }\n  }\n}"
+            },
+            {
+              "name": "Temporal Not Ready",
+              "status": "Service Unavailable",
+              "code": 503,
+              "header": [{"key": "Content-Type", "value": "application/json"}],
+              "body": "{\n  \"status\": \"DOWN\",\n  \"components\": {\n    \"db\": { \"status\": \"UP\" },\n    \"temporal\": { \"status\": \"DOWN\", \"details\": { \"error\": \"Connection refused\" } }\n  }\n}"
+            }
+          ]
+        },
+        {
+          "name": "Health Check — Liveness Only",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/actuator/health/liveness",
+              "host": ["{{baseUrl}}"],
+              "path": ["actuator", "health", "liveness"]
+            },
+            "description": "Kubernetes-style liveness probe — only checks if the JVM process is alive, not dependencies."
+          },
+          "response": [
+            {
+              "name": "Alive",
+              "status": "OK",
+              "code": 200,
+              "body": "{ \"status\": \"UP\" }"
+            }
+          ]
+        },
+        {
+          "name": "Actuator — All Endpoints",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/actuator",
+              "host": ["{{baseUrl}}"],
+              "path": ["actuator"]
+            },
+            "description": "Lists all available Spring Boot Actuator endpoints."
+          },
+          "response": []
+        },
+        {
+          "name": "Actuator — Application Info",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/actuator/info",
+              "host": ["{{baseUrl}}"],
+              "path": ["actuator", "info"]
+            },
+            "description": "Returns application info (name, version, description) from build.gradle."
+          },
+          "response": []
+        },
+        {
+          "name": "Actuator — Metrics",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/actuator/metrics",
+              "host": ["{{baseUrl}}"],
+              "path": ["actuator", "metrics"]
+            },
+            "description": "JVM and application metrics — memory, threads, HTTP request counts, etc."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "2. Trigger Pipeline",
+      "description": "Start a code review pipeline run. All triggers are equivalent — they all start the same 6-agent Temporal workflow.",
+      "item": [
+        {
+          "name": "Trigger Review — auth-service-jwt (Proven Test Repo)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 202) {",
+                  "    const body = pm.response.json();",
+                  "    if (body.runId) {",
+                  "        pm.collectionVariables.set('runId', body.runId);",
+                  "        console.log('✅ runId saved to collection variable:', body.runId);",
+                  "    }",
+                  "}",
+                  "",
+                  "pm.test('Status is 202 Accepted', () => pm.response.to.have.status(202));",
+                  "pm.test('Response has runId', () => {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body).to.have.property('runId');",
+                  "    pm.expect(body.runId).to.match(/^[0-9a-f-]{36}$/);",
+                  "});",
+                  "pm.test('Status is PENDING', () => {",
+                  "    pm.expect(pm.response.json().status).to.eql('PENDING');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {"key": "Content-Type", "value": "application/json"}
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"repoUrl\": \"https://github.com/Skpandey15/auth-service-jwt.git\",\n  \"branch\": \"main\"\n}",
+              "options": {"raw": {"language": "json"}}
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/review/trigger",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "review", "trigger"]
+            },
+            "description": "Triggers the 6-agent code review pipeline on the auth-service-jwt repository.\n\nThis is the **proven test repo** — the system found 54 issues, eliminated 17 false positives, applied 15 fixes, and raised PR #5.\n\n**The test script automatically saves the returned `runId` to the collection variable.**\n\nAfter triggering:\n- Watch progress at Temporal UI: http://localhost:8080\n- Monitor logs: `docker compose logs -f app`\n- Poll status with: `GET /api/review/status/{{runId}}`\n\n**Pipeline duration:** ~5-8 minutes (GPT-4o analysis takes the longest)"
+          },
+          "response": [
+            {
+              "name": "202 Accepted — Review Started",
+              "status": "Accepted",
+              "code": 202,
+              "header": [{"key": "Content-Type", "value": "application/json"}],
+              "body": "{\n  \"runId\": \"550e8400-e29b-41d4-a716-446655440000\",\n  \"status\": \"PENDING\",\n  \"repoUrl\": \"https://github.com/Skpandey15/auth-service-jwt.git\",\n  \"branch\": \"main\",\n  \"message\": \"Code review pipeline started. Monitor at /api/review/status/550e8400-e29b-41d4-a716-446655440000\"\n}"
+            },
+            {
+              "name": "400 Bad Request — Missing repoUrl",
+              "status": "Bad Request",
+              "code": 400,
+              "header": [{"key": "Content-Type", "value": "application/problem+json"}],
+              "body": "{\n  \"type\": \"https://problems.codereview.ai/validation-error\",\n  \"title\": \"Validation Failed\",\n  \"status\": 400,\n  \"detail\": \"repoUrl must not be blank\",\n  \"instance\": \"/api/review/trigger\",\n  \"timestamp\": \"2026-06-28T10:30:00Z\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Trigger Review — Custom Repository",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 202) {",
+                  "    const body = pm.response.json();",
+                  "    if (body.runId) {",
+                  "        pm.collectionVariables.set('runId', body.runId);",
+                  "        console.log('✅ runId saved:', body.runId);",
+                  "    }",
+                  "}",
+                  "pm.test('Status is 202 Accepted', () => pm.response.to.have.status(202));"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {"key": "Content-Type", "value": "application/json"}
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"repoUrl\": \"{{targetRepoUrl}}\",\n  \"branch\": \"{{targetBranch}}\"\n}",
+              "options": {"raw": {"language": "json"}}
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/review/trigger",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "review", "trigger"]
+            },
+            "description": "Triggers a review on any repository. Set `targetRepoUrl` and `targetBranch` collection variables to change the target.\n\n**Supported file types:** .java .py .js .ts .go .rb .php .cs .cpp .kt .rs .swift\n\n**Limits:** Max 200 files, max 100 KB per file."
+          },
+          "response": []
+        },
+        {
+          "name": "Trigger Review — Feature Branch",
+          "request": {
+            "method": "POST",
+            "header": [
+              {"key": "Content-Type", "value": "application/json"}
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"repoUrl\": \"https://github.com/Skpandey15/auth-service-jwt.git\",\n  \"branch\": \"feature/new-auth-flow\"\n}",
+              "options": {"raw": {"language": "json"}}
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/review/trigger",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "review", "trigger"]
+            },
+            "description": "Review a specific feature branch before it is merged to main."
+          },
+          "response": []
+        },
+        {
+          "name": "Trigger Review — Validation Error (Empty repoUrl)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {"key": "Content-Type", "value": "application/json"}
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"repoUrl\": \"\",\n  \"branch\": \"main\"\n}",
+              "options": {"raw": {"language": "json"}}
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/review/trigger",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "review", "trigger"]
+            },
+            "description": "Demonstrates RFC 7807 ProblemDetail validation error response when repoUrl is blank."
+          },
+          "response": [
+            {
+              "name": "400 Bad Request",
+              "status": "Bad Request",
+              "code": 400,
+              "header": [{"key": "Content-Type", "value": "application/problem+json"}],
+              "body": "{\n  \"type\": \"https://problems.codereview.ai/validation-error\",\n  \"title\": \"Validation Failed\",\n  \"status\": 400,\n  \"detail\": \"repoUrl must not be blank\",\n  \"instance\": \"/api/review/trigger\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Trigger Review — Validation Error (No Body)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {"key": "Content-Type", "value": "application/json"}
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {"raw": {"language": "json"}}
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/review/trigger",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "review", "trigger"]
+            },
+            "description": "Demonstrates validation error when required fields are missing entirely."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "3. Poll Pipeline Status",
+      "description": "Check the status of a pipeline run. Poll until status is COMPLETED or FAILED.",
+      "item": [
+        {
+          "name": "Get Run Status — By Variable runId",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "",
+                  "const body = pm.response.json();",
+                  "const status = body.status;",
+                  "console.log('Pipeline status:', status);",
+                  "",
+                  "if (status === 'COMPLETED') {",
+                  "    console.log('✅ Pipeline COMPLETED');",
+                  "    console.log('PR URL:', body.prUrl);",
+                  "    console.log('Issues found:', body.totalIssuesFound);",
+                  "    console.log('Issues fixed:', body.totalIssuesFixed);",
+                  "    console.log('False positives:', body.totalFalsePositives);",
+                  "} else if (status === 'FAILED') {",
+                  "    console.error('❌ Pipeline FAILED:', body.errorMessage);",
+                  "} else {",
+                  "    console.log('⏳ Still running — poll again in 30s');",
+                  "}",
+                  "",
+                  "pm.test('Response has required fields', () => {",
+                  "    pm.expect(body).to.have.all.keys(['runId', 'repoUrl', 'branch', 'status', 'startedAt']);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/review/status/{{runId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "review", "status", "{{runId}}"]
+            },
+            "description": "Gets the current status of a pipeline run using the `runId` collection variable.\n\n**Status values:**\n- `PENDING` — workflow queued, not yet started\n- `RUNNING` — pipeline executing (Reader → Analyser → Critic → Fixer → PR → Notifier)\n- `COMPLETED` — all agents finished, PR raised, findings saved\n- `FAILED` — unrecoverable error (check `errorMessage` field)\n\n**Polling strategy:** Poll every 30 seconds. Total duration ~5-8 minutes.\n\n**Better alternative:** Watch progress live at Temporal UI → http://localhost:8080"
+          },
+          "response": [
+            {
+              "name": "PENDING — Just Triggered",
+              "status": "OK",
+              "code": 200,
+              "header": [{"key": "Content-Type", "value": "application/json"}],
+              "body": "{\n  \"runId\": \"550e8400-e29b-41d4-a716-446655440000\",\n  \"repoUrl\": \"https://github.com/Skpandey15/auth-service-jwt.git\",\n  \"branch\": \"main\",\n  \"status\": \"PENDING\",\n  \"triggerType\": \"MANUAL\",\n  \"totalIssuesFound\": 0,\n  \"totalIssuesFixed\": 0,\n  \"totalFalsePositives\": 0,\n  \"prUrl\": null,\n  \"prBranch\": null,\n  \"errorMessage\": null,\n  \"startedAt\": \"2026-06-28T10:30:00Z\",\n  \"completedAt\": null\n}"
+            },
+            {
+              "name": "RUNNING — In Progress",
+              "status": "OK",
+              "code": 200,
+              "header": [{"key": "Content-Type", "value": "application/json"}],
+              "body": "{\n  \"runId\": \"550e8400-e29b-41d4-a716-446655440000\",\n  \"repoUrl\": \"https://github.com/Skpandey15/auth-service-jwt.git\",\n  \"branch\": \"main\",\n  \"status\": \"RUNNING\",\n  \"triggerType\": \"MANUAL\",\n  \"totalIssuesFound\": 54,\n  \"totalIssuesFixed\": 0,\n  \"totalFalsePositives\": 0,\n  \"prUrl\": null,\n  \"prBranch\": null,\n  \"errorMessage\": null,\n  \"startedAt\": \"2026-06-28T10:30:00Z\",\n  \"completedAt\": null\n}"
+            },
+            {
+              "name": "COMPLETED — PR Raised",
+              "status": "OK",
+              "code": 200,
+              "header": [{"key": "Content-Type", "value": "application/json"}],
+              "body": "{\n  \"runId\": \"550e8400-e29b-41d4-a716-446655440000\",\n  \"repoUrl\": \"https://github.com/Skpandey15/auth-service-jwt.git\",\n  \"branch\": \"main\",\n  \"status\": \"COMPLETED\",\n  \"triggerType\": \"MANUAL\",\n  \"totalIssuesFound\": 54,\n  \"totalIssuesFixed\": 15,\n  \"totalFalsePositives\": 17,\n  \"prUrl\": \"https://github.com/Skpandey15/auth-service-jwt/pull/5\",\n  \"prBranch\": \"code-review/ai-fixes-550e8400\",\n  \"errorMessage\": null,\n  \"startedAt\": \"2026-06-28T10:30:00Z\",\n  \"completedAt\": \"2026-06-28T10:36:22Z\"\n}"
+            },
+            {
+              "name": "FAILED — GitHub Token Error",
+              "status": "OK",
+              "code": 200,
+              "header": [{"key": "Content-Type", "value": "application/json"}],
+              "body": "{\n  \"runId\": \"550e8400-e29b-41d4-a716-446655440000\",\n  \"repoUrl\": \"https://github.com/Skpandey15/auth-service-jwt.git\",\n  \"branch\": \"main\",\n  \"status\": \"FAILED\",\n  \"triggerType\": \"MANUAL\",\n  \"totalIssuesFound\": 54,\n  \"totalIssuesFixed\": 0,\n  \"totalFalsePositives\": 17,\n  \"prUrl\": null,\n  \"prBranch\": null,\n  \"errorMessage\": \"GitHub API error: 403 Forbidden — token lacks Contents:Write permission\",\n  \"startedAt\": \"2026-06-28T10:30:00Z\",\n  \"completedAt\": \"2026-06-28T10:35:10Z\"\n}"
+            },
+            {
+              "name": "404 — Run Not Found",
+              "status": "Not Found",
+              "code": 404,
+              "header": [{"key": "Content-Type", "value": "application/problem+json"}],
+              "body": "{\n  \"type\": \"https://problems.codereview.ai/not-found\",\n  \"title\": \"Pipeline Run Not Found\",\n  \"status\": 404,\n  \"detail\": \"No pipeline run found with id: 550e8400-e29b-41d4-a716-446655440000\",\n  \"instance\": \"/api/review/status/550e8400-e29b-41d4-a716-446655440000\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Get Run Status — Specific Run ID",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/review/status/550e8400-e29b-41d4-a716-446655440000",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "review", "status", "550e8400-e29b-41d4-a716-446655440000"]
+            },
+            "description": "Get status using a hardcoded run ID. Replace the UUID with your actual run ID."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "4. GitHub Webhook",
+      "description": "Simulate GitHub push events that automatically trigger a code review. The webhook payload must be signed with HMAC-SHA256.",
+      "item": [
+        {
+          "name": "Webhook — Push Event (Pre-signed Example)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {"key": "Content-Type", "value": "application/json"},
+              {"key": "X-GitHub-Event", "value": "push"},
+              {"key": "X-Hub-Signature-256", "value": "sha256=abc123REPLACE_WITH_VALID_HMAC_SIGNATURE"},
+              {"key": "X-GitHub-Delivery", "value": "72d3162e-cc78-11e3-81ab-4c9367dc0958"}
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"ref\": \"refs/heads/main\",\n  \"repository\": {\n    \"clone_url\": \"https://github.com/Skpandey15/auth-service-jwt.git\",\n    \"full_name\": \"Skpandey15/auth-service-jwt\",\n    \"default_branch\": \"main\"\n  },\n  \"pusher\": {\n    \"name\": \"Skpandey15\",\n    \"email\": \"skp4ml@gmail.com\"\n  },\n  \"commits\": [\n    {\n      \"id\": \"abc123def456\",\n      \"message\": \"Add JWT authentication middleware\",\n      \"author\": { \"name\": \"Skpandey15\" }\n    }\n  ]\n}",
+              "options": {"raw": {"language": "json"}}
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/webhook/github",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "webhook", "github"]
+            },
+            "description": "Simulates a GitHub push webhook event.\n\n**⚠️ IMPORTANT:** The `X-Hub-Signature-256` header must be a valid HMAC-SHA256 signature of the request body using your `GITHUB_WEBHOOK_SECRET`.\n\n**How to generate the signature (bash):**\n```bash\nSECRET=\"your_webhook_secret_here\"\nBODY='{\"ref\":\"refs/heads/main\",...}'\necho -n \"$BODY\" | openssl dgst -sha256 -hmac \"$SECRET\"\n```\n\n**How to generate the signature (PowerShell):**\n```powershell\n$secret = \"your_webhook_secret_here\"\n$body = Get-Content -Raw payload.json\n$hmac = [System.Security.Cryptography.HMACSHA256]::new([Text.Encoding]::UTF8.GetBytes($secret))\n$hash = $hmac.ComputeHash([Text.Encoding]::UTF8.GetBytes($body))\n\"sha256=\" + [BitConverter]::ToString($hash).Replace(\"-\",\"\").ToLower()\n```\n\n**GitHub webhook configuration:**\n- Payload URL: `http://your-server:8081/api/webhook/github`\n- Content type: `application/json`\n- Secret: value of `GITHUB_WEBHOOK_SECRET` in your `.env`\n- Events: Just the push event"
+          },
+          "response": [
+            {
+              "name": "202 Accepted — Review Started",
+              "status": "Accepted",
+              "code": 202,
+              "header": [{"key": "Content-Type", "value": "application/json"}],
+              "body": "{\n  \"runId\": \"7a3f1c2d-4b5e-6f7a-8b9c-0d1e2f3a4b5c\",\n  \"message\": \"Code review pipeline triggered by webhook\",\n  \"repoUrl\": \"https://github.com/Skpandey15/auth-service-jwt.git\",\n  \"branch\": \"main\"\n}"
+            },
+            {
+              "name": "401 Unauthorized — Invalid Signature",
+              "status": "Unauthorized",
+              "code": 401,
+              "header": [{"key": "Content-Type", "value": "application/problem+json"}],
+              "body": "{\n  \"type\": \"https://problems.codereview.ai/unauthorized\",\n  \"title\": \"Webhook Signature Invalid\",\n  \"status\": 401,\n  \"detail\": \"HMAC-SHA256 signature mismatch — verify GITHUB_WEBHOOK_SECRET matches your GitHub webhook configuration\",\n  \"instance\": \"/api/webhook/github\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Webhook — Pull Request Event (Non-Push, Ignored)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {"key": "Content-Type", "value": "application/json"},
+              {"key": "X-GitHub-Event", "value": "pull_request"},
+              {"key": "X-Hub-Signature-256", "value": "sha256=abc123REPLACE_WITH_VALID_HMAC_SIGNATURE"}
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"action\": \"opened\",\n  \"pull_request\": {\n    \"number\": 5,\n    \"title\": \"[AI Review] 15 security and quality fixes\"\n  }\n}",
+              "options": {"raw": {"language": "json"}}
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/webhook/github",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "webhook", "github"]
+            },
+            "description": "Non-push events (pull_request, issues, etc.) are received but do not trigger a review. The system only acts on `push` events to avoid infinite loops from AI-raised PRs."
+          },
+          "response": [
+            {
+              "name": "200 — Event Acknowledged, Not Processed",
+              "status": "OK",
+              "code": 200,
+              "body": "{ \"message\": \"Event type pull_request not processed\" }"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "5. GraphQL API",
+      "description": "Query pipeline results via GraphQL. Open the interactive explorer at http://localhost:8081/graphiql",
+      "item": [
+        {
+          "name": "GraphQL — All Pipeline Runs",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('No GraphQL errors', () => {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body).to.not.have.property('errors');",
+                  "    pm.expect(body.data).to.have.property('allRuns');",
+                  "});",
+                  "const runs = pm.response.json().data?.allRuns ?? [];",
+                  "console.log('Total runs in DB:', runs.length);",
+                  "runs.forEach(r => console.log(`  ${r.id} | ${r.status} | fixed:${r.totalIssuesFixed} | ${r.prUrl ?? 'no PR'}`));"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {"key": "Content-Type", "value": "application/json"}
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"query\": \"query AllRuns {\\n  allRuns {\\n    id\\n    repoUrl\\n    branch\\n    status\\n    triggerType\\n    totalIssuesFound\\n    totalIssuesFixed\\n    totalFalsePositives\\n    prUrl\\n    prBranch\\n    errorMessage\\n    startedAt\\n    completedAt\\n  }\\n}\"",
+              "options": {"raw": {"language": "json"}}
+            },
+            "url": {
+              "raw": "{{baseUrl}}/graphql",
+              "host": ["{{baseUrl}}"],
+              "path": ["graphql"]
+            },
+            "description": "Retrieves all pipeline runs from the database. Returns newest first.\n\nFor the interactive GraphiQL editor, open: http://localhost:8081/graphiql"
+          },
+          "response": [
+            {
+              "name": "200 — Runs Returned",
+              "status": "OK",
+              "code": 200,
+              "header": [{"key": "Content-Type", "value": "application/json"}],
+              "body": "{\n  \"data\": {\n    \"allRuns\": [\n      {\n        \"id\": \"550e8400-e29b-41d4-a716-446655440000\",\n        \"repoUrl\": \"https://github.com/Skpandey15/auth-service-jwt.git\",\n        \"branch\": \"main\",\n        \"status\": \"COMPLETED\",\n        \"triggerType\": \"MANUAL\",\n        \"totalIssuesFound\": 54,\n        \"totalIssuesFixed\": 15,\n        \"totalFalsePositives\": 17,\n        \"prUrl\": \"https://github.com/Skpandey15/auth-service-jwt/pull/5\",\n        \"prBranch\": \"code-review/ai-fixes-550e8400\",\n        \"errorMessage\": null,\n        \"startedAt\": \"2026-06-28T10:30:00Z\",\n        \"completedAt\": \"2026-06-28T10:36:22Z\"\n      }\n    ]\n  }\n}"
+            }
+          ]
+        },
+        {
+          "name": "GraphQL — All Runs With Findings",
+          "request": {
+            "method": "POST",
+            "header": [
+              {"key": "Content-Type", "value": "application/json"}
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"query\": \"query AllRunsWithFindings {\\n  allRuns {\\n    id\\n    repoUrl\\n    status\\n    totalIssuesFound\\n    totalIssuesFixed\\n    totalFalsePositives\\n    prUrl\\n    startedAt\\n    completedAt\\n    findings {\\n      id\\n      filePath\\n      lineNumber\\n      issueType\\n      severity\\n      confidence\\n      status\\n      description\\n      originalCode\\n      fixedCode\\n      commitMessage\\n      criticReasoning\\n      createdAt\\n    }\\n  }\\n}\"",
+              "options": {"raw": {"language": "json"}}
+            },
+            "url": {
+              "raw": "{{baseUrl}}/graphql",
+              "host": ["{{baseUrl}}"],
+              "path": ["graphql"]
+            },
+            "description": "Retrieves all runs with their complete findings. This is the richest query — includes Critic reasoning for every finding."
+          },
+          "response": [
+            {
+              "name": "200 — With Findings",
+              "status": "OK",
+              "code": 200,
+              "body": "{\n  \"data\": {\n    \"allRuns\": [\n      {\n        \"id\": \"550e8400-e29b-41d4-a716-446655440000\",\n        \"status\": \"COMPLETED\",\n        \"totalIssuesFound\": 54,\n        \"totalIssuesFixed\": 15,\n        \"findings\": [\n          {\n            \"id\": \"abc-123\",\n            \"filePath\": \"src/main/java/com/example/auth/JwtService.java\",\n            \"lineNumber\": 42,\n            \"issueType\": \"HARDCODED_SECRET\",\n            \"severity\": \"HIGH\",\n            \"confidence\": 95,\n            \"status\": \"FIXED\",\n            \"description\": \"JWT secret key is hardcoded as a string literal\",\n            \"originalCode\": \"private static final String SECRET = \\\"mySecretKey123\\\";\",\n            \"fixedCode\": \"private static final String SECRET = System.getenv(\\\"JWT_SECRET\\\");\",\n            \"commitMessage\": \"fix(security): replace hardcoded JWT secret with environment variable\",\n            \"criticReasoning\": \"CONFIRMED: The secret is clearly hardcoded at line 42. This is a HIGH severity finding — any developer with repo access can extract the production JWT secret.\",\n            \"createdAt\": \"2026-06-28T10:35:00Z\"\n          }\n        ]\n      }\n    ]\n  }\n}"
+            }
+          ]
+        },
+        {
+          "name": "GraphQL — Single Run By ID",
+          "request": {
+            "method": "POST",
+            "header": [
+              {"key": "Content-Type", "value": "application/json"}
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"query\": \"query SingleRun($id: ID!) {\\n  pipelineRun(id: $id) {\\n    id\\n    repoUrl\\n    branch\\n    status\\n    totalIssuesFound\\n    totalIssuesFixed\\n    totalFalsePositives\\n    prUrl\\n    prBranch\\n    errorMessage\\n    startedAt\\n    completedAt\\n    findings {\\n      filePath\\n      lineNumber\\n      issueType\\n      severity\\n      confidence\\n      status\\n      description\\n      fixedCode\\n      commitMessage\\n      criticReasoning\\n    }\\n  }\\n}\",\n  \"variables\": {\n    \"id\": \"{{runId}}\"\n  }\n}",
+              "options": {"raw": {"language": "json"}}
+            },
+            "url": {
+              "raw": "{{baseUrl}}/graphql",
+              "host": ["{{baseUrl}}"],
+              "path": ["graphql"]
+            },
+            "description": "Fetch a specific pipeline run by UUID using GraphQL variables.\n\nThe `{{runId}}` collection variable is automatically populated when you trigger a review using the test script."
+          },
+          "response": []
+        },
+        {
+          "name": "GraphQL — Only Fixed Findings",
+          "request": {
+            "method": "POST",
+            "header": [
+              {"key": "Content-Type", "value": "application/json"}
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"query\": \"query FixedFindings {\\n  allRuns {\\n    id\\n    repoUrl\\n    status\\n    prUrl\\n    findings {\\n      filePath\\n      lineNumber\\n      issueType\\n      severity\\n      status\\n      originalCode\\n      fixedCode\\n      commitMessage\\n    }\\n  }\\n}\"",
+              "options": {"raw": {"language": "json"}}
+            },
+            "url": {
+              "raw": "{{baseUrl}}/graphql",
+              "host": ["{{baseUrl}}"],
+              "path": ["graphql"]
+            },
+            "description": "Fetch all runs with findings. Filter client-side for status == 'FIXED' to see only applied patches.\n\nNote: Server-side filtering by finding status can be added via a `findingsByStatus` query if needed."
+          },
+          "response": []
+        },
+        {
+          "name": "GraphQL — Schema Introspection",
+          "request": {
+            "method": "POST",
+            "header": [
+              {"key": "Content-Type", "value": "application/json"}
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"query\": \"{ __schema { types { name kind description fields { name type { name kind } } } } }\"",
+              "options": {"raw": {"language": "json"}}
+            },
+            "url": {
+              "raw": "{{baseUrl}}/graphql",
+              "host": ["{{baseUrl}}"],
+              "path": ["graphql"]
+            },
+            "description": "Full GraphQL schema introspection — returns all types, fields, and their descriptions.\n\nUseful for discovering the exact field names when building queries."
+          },
+          "response": []
+        },
+        {
+          "name": "GraphQL — Query Types Only",
+          "request": {
+            "method": "POST",
+            "header": [
+              {"key": "Content-Type", "value": "application/json"}
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"query\": \"{ __type(name: \\\"Query\\\") { name fields { name description args { name type { name kind ofType { name } } } type { name kind ofType { name kind } } } } }\"",
+              "options": {"raw": {"language": "json"}}
+            },
+            "url": {
+              "raw": "{{baseUrl}}/graphql",
+              "host": ["{{baseUrl}}"],
+              "path": ["graphql"]
+            },
+            "description": "Introspect just the Query type to see available query operations and their arguments."
+          },
+          "response": []
+        },
+        {
+          "name": "GraphQL — Run Summary Statistics",
+          "request": {
+            "method": "POST",
+            "header": [
+              {"key": "Content-Type", "value": "application/json"}
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"query\": \"query RunSummary {\\n  allRuns {\\n    id\\n    status\\n    totalIssuesFound\\n    totalIssuesFixed\\n    totalFalsePositives\\n    startedAt\\n    completedAt\\n  }\\n}\"",
+              "options": {"raw": {"language": "json"}}
+            },
+            "url": {
+              "raw": "{{baseUrl}}/graphql",
+              "host": ["{{baseUrl}}"],
+              "path": ["graphql"]
+            },
+            "description": "Lightweight summary query — no findings subfields. Use for dashboards or listing all runs."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "6. Observability",
+      "description": "Access observability UIs and monitoring endpoints.",
+      "item": [
+        {
+          "name": "GraphiQL UI — Interactive GraphQL Explorer",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/graphiql",
+              "host": ["{{baseUrl}}"],
+              "path": ["graphiql"]
+            },
+            "description": "Opens the self-hosted GraphiQL UI.\n\n**Note:** Open this in a browser, not in Postman.\n\nURL: http://localhost:8081/graphiql\n\nFeatures:\n- Pre-loaded with AllRuns query example\n- Schema explorer (Docs panel on the right)\n- Local assets — no CDN dependency\n- Dark-themed with system branding"
+          },
+          "response": []
+        },
+        {
+          "name": "Temporal UI",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "http://localhost:8080",
+              "raw": "http://localhost:8080"
+            },
+            "description": "Temporal workflow visibility UI.\n\n**Open in browser:** http://localhost:8080\n\nShows:\n- All workflow executions (running + completed + failed)\n- Activity timeline for each workflow\n- Input/output of each activity\n- Retry history\n- Full workflow event history (replay log)"
+          },
+          "response": []
+        },
+        {
+          "name": "Actuator — JVM Memory Metrics",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/actuator/metrics/jvm.memory.used",
+              "host": ["{{baseUrl}}"],
+              "path": ["actuator", "metrics", "jvm.memory.used"]
+            },
+            "description": "Current JVM heap memory usage in bytes."
+          },
+          "response": []
+        },
+        {
+          "name": "Actuator — HTTP Request Count",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/actuator/metrics/http.server.requests",
+              "host": ["{{baseUrl}}"],
+              "path": ["actuator", "metrics", "http.server.requests"]
+            },
+            "description": "Total HTTP requests served, tagged by method, status, and URI."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "7. Error Scenarios",
+      "description": "Test error handling — RFC 7807 ProblemDetail format, HMAC rejection, not found responses.",
+      "item": [
+        {
+          "name": "404 — Run Not Found",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/review/status/00000000-0000-0000-0000-000000000000",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "review", "status", "00000000-0000-0000-0000-000000000000"]
+            },
+            "description": "Requesting a non-existent run ID returns RFC 7807 ProblemDetail with 404 status."
+          },
+          "response": [
+            {
+              "name": "404 Not Found",
+              "status": "Not Found",
+              "code": 404,
+              "header": [{"key": "Content-Type", "value": "application/problem+json"}],
+              "body": "{\n  \"type\": \"https://problems.codereview.ai/not-found\",\n  \"title\": \"Pipeline Run Not Found\",\n  \"status\": 404,\n  \"detail\": \"No pipeline run found with id: 00000000-0000-0000-0000-000000000000\",\n  \"instance\": \"/api/review/status/00000000-0000-0000-0000-000000000000\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "400 — Validation Error (Missing repoUrl)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {"key": "Content-Type", "value": "application/json"}
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"branch\": \"main\"\n}",
+              "options": {"raw": {"language": "json"}}
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/review/trigger",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "review", "trigger"]
+            },
+            "description": "Missing required `repoUrl` field — returns RFC 7807 ProblemDetail with field-level error detail."
+          },
+          "response": [
+            {
+              "name": "400 Validation Error",
+              "status": "Bad Request",
+              "code": 400,
+              "header": [{"key": "Content-Type", "value": "application/problem+json"}],
+              "body": "{\n  \"type\": \"https://problems.codereview.ai/validation-error\",\n  \"title\": \"Validation Failed\",\n  \"status\": 400,\n  \"detail\": \"repoUrl: must not be blank\",\n  \"instance\": \"/api/review/trigger\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "400 — Invalid JSON Body",
+          "request": {
+            "method": "POST",
+            "header": [
+              {"key": "Content-Type", "value": "application/json"}
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{ invalid json }",
+              "options": {"raw": {"language": "json"}}
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/review/trigger",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "review", "trigger"]
+            },
+            "description": "Malformed JSON body returns RFC 7807 ProblemDetail with parse error details."
+          },
+          "response": []
+        },
+        {
+          "name": "401 — Webhook Invalid Signature",
+          "request": {
+            "method": "POST",
+            "header": [
+              {"key": "Content-Type", "value": "application/json"},
+              {"key": "X-GitHub-Event", "value": "push"},
+              {"key": "X-Hub-Signature-256", "value": "sha256=INVALID_SIGNATURE_HERE"}
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"ref\": \"refs/heads/main\",\n  \"repository\": { \"clone_url\": \"https://github.com/test/repo.git\" }\n}",
+              "options": {"raw": {"language": "json"}}
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/webhook/github",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "webhook", "github"]
+            },
+            "description": "Invalid HMAC-SHA256 signature on webhook request is rejected with 401 Unauthorized."
+          },
+          "response": [
+            {
+              "name": "401 Unauthorized",
+              "status": "Unauthorized",
+              "code": 401,
+              "header": [{"key": "Content-Type", "value": "application/problem+json"}],
+              "body": "{\n  \"type\": \"https://problems.codereview.ai/unauthorized\",\n  \"title\": \"Webhook Signature Invalid\",\n  \"status\": 401,\n  \"detail\": \"HMAC-SHA256 signature mismatch\",\n  \"instance\": \"/api/webhook/github\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "405 — Method Not Allowed",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/review/trigger",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "review", "trigger"]
+            },
+            "description": "DELETE is not supported on the trigger endpoint — returns 405 Method Not Allowed."
+          },
+          "response": []
+        },
+        {
+          "name": "GraphQL — Error (Unknown Field)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {"key": "Content-Type", "value": "application/json"}
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"query\": \"{ allRuns { id nonExistentField } }\"\n}",
+              "options": {"raw": {"language": "json"}}
+            },
+            "url": {
+              "raw": "{{baseUrl}}/graphql",
+              "host": ["{{baseUrl}}"],
+              "path": ["graphql"]
+            },
+            "description": "GraphQL returns a structured error when querying a field that does not exist in the schema."
+          },
+          "response": [
+            {
+              "name": "200 with GraphQL Error",
+              "status": "OK",
+              "code": 200,
+              "body": "{\n  \"errors\": [\n    {\n      \"message\": \"Field 'nonExistentField' in type 'PipelineRun' is undefined\",\n      \"locations\": [{ \"line\": 1, \"column\": 15 }],\n      \"extensions\": { \"classification\": \"ValidationError\" }\n    }\n  ]\n}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "8. End-to-End Flow",
+      "description": "Run these requests in sequence to execute and observe a complete pipeline run.",
+      "item": [
+        {
+          "name": "Step 1 — Check Health",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('App is healthy', () => {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(pm.response.json().status).to.eql('UP');",
+                  "});",
+                  "console.log('✅ Step 1 PASSED — App is healthy. Proceed to Step 2.');"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/actuator/health",
+              "host": ["{{baseUrl}}"],
+              "path": ["actuator", "health"]
+            },
+            "description": "**Step 1 of E2E flow.** Verify all containers are healthy before triggering a review."
+          },
+          "response": []
+        },
+        {
+          "name": "Step 2 — Trigger Review",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Trigger accepted', () => pm.response.to.have.status(202));",
+                  "const body = pm.response.json();",
+                  "pm.collectionVariables.set('runId', body.runId);",
+                  "console.log('✅ Step 2 PASSED — runId:', body.runId);",
+                  "console.log('⏳ Step 3: Wait ~5-8 min then run Step 3 to check completion.');",
+                  "console.log('👁️  Watch live at: http://localhost:8080 (Temporal UI)');"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"repoUrl\": \"https://github.com/Skpandey15/auth-service-jwt.git\",\n  \"branch\": \"main\"\n}",
+              "options": {"raw": {"language": "json"}}
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/review/trigger",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "review", "trigger"]
+            },
+            "description": "**Step 2 of E2E flow.** Trigger the review and save the runId automatically."
+          },
+          "response": []
+        },
+        {
+          "name": "Step 3 — Poll Status Until Complete",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status endpoint reachable', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "const status = body.status;",
+                  "",
+                  "if (status === 'COMPLETED') {",
+                  "    console.log('✅ Step 3 PASSED — Pipeline COMPLETED');",
+                  "    console.log('   Issues found:    ', body.totalIssuesFound);",
+                  "    console.log('   False positives: ', body.totalFalsePositives);",
+                  "    console.log('   Fixes applied:   ', body.totalIssuesFixed);",
+                  "    console.log('   PR URL:          ', body.prUrl);",
+                  "    pm.test('PR URL is set', () => pm.expect(body.prUrl).to.be.a('string'));",
+                  "} else if (status === 'FAILED') {",
+                  "    console.error('❌ Pipeline FAILED:', body.errorMessage);",
+                  "    pm.test('Pipeline should not fail', () => pm.expect(status).to.not.eql('FAILED'));",
+                  "} else {",
+                  "    console.log('⏳ Status:', status, '— still running. Run Step 3 again in 30 seconds.');",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/review/status/{{runId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "review", "status", "{{runId}}"]
+            },
+            "description": "**Step 3 of E2E flow.** Poll this endpoint every 30 seconds until status is COMPLETED or FAILED.\n\nExpected completion time: ~5-8 minutes.\n\nThe test script prints a full summary on completion."
+          },
+          "response": []
+        },
+        {
+          "name": "Step 4 — Query Results via GraphQL",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('GraphQL query successful', () => {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(pm.response.json()).to.not.have.property('errors');",
+                  "});",
+                  "const run = pm.response.json().data?.pipelineRun;",
+                  "if (run) {",
+                  "    console.log('✅ Step 4 PASSED — GraphQL results:');",
+                  "    console.log('   Total findings:', run.findings?.length ?? 0);",
+                  "    const fixed = run.findings?.filter(f => f.status === 'FIXED') ?? [];",
+                  "    const fp = run.findings?.filter(f => f.status === 'FALSE_POSITIVE') ?? [];",
+                  "    console.log('   Fixed:', fixed.length, '| False positives:', fp.length);",
+                  "    fixed.forEach(f => console.log('   FIX:', f.filePath, 'L'+f.lineNumber, '-', f.issueType));",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"query\": \"query RunResults($id: ID!) {\\n  pipelineRun(id: $id) {\\n    id status prUrl\\n    totalIssuesFound totalIssuesFixed totalFalsePositives\\n    findings {\\n      filePath lineNumber issueType severity confidence status\\n      description fixedCode commitMessage criticReasoning\\n    }\\n  }\\n}\",\n  \"variables\": { \"id\": \"{{runId}}\" }\n}",
+              "options": {"raw": {"language": "json"}}
+            },
+            "url": {
+              "raw": "{{baseUrl}}/graphql",
+              "host": ["{{baseUrl}}"],
+              "path": ["graphql"]
+            },
+            "description": "**Step 4 of E2E flow.** Query all findings for the completed run including Critic reasoning and applied fixes."
+          },
+          "response": []
+        }
+      ]
+    }
+  ]
+}
