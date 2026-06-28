@@ -1,0 +1,62 @@
+type Query {
+    pipelineRun(runId: String!): PipelineRun
+    allRuns: [PipelineRun!]!
+}
+
+type PipelineRun {
+    id: ID!
+    repoUrl: String!
+    branch: String!
+    triggeredBy: String!
+    status: RunStatus!
+    prUrl: String
+    prBranch: String
+    totalIssuesFound: Int
+    totalIssuesFixed: Int
+    totalFalsePositives: Int
+    startedAt: String
+    completedAt: String
+    findings: [Finding!]!
+}
+
+type Finding {
+    id: ID!
+    filePath: String!
+    lineNumber: Int
+    description: String!
+    issueType: String!
+    severity: Severity!
+    confidence: Int!
+    status: FindingStatus!
+    originalCode: String
+    fixedCode: String
+    commitMessage: String
+    criticReasoning: String
+    detectedAt: String
+}
+
+enum RunStatus {
+    PENDING
+    CLONING
+    ANALYSING
+    VERIFYING
+    FIXING
+    NOTIFYING
+    COMPLETED
+    FAILED
+}
+
+enum Severity {
+    HIGH
+    MEDIUM
+    LOW
+}
+
+enum FindingStatus {
+    PENDING_REVIEW
+    CONFIRMED
+    FALSE_POSITIVE
+    NEEDS_HUMAN
+    FIXED
+    SKIPPED
+}

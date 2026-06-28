@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>GraphiQL — Multi-Agent Code Review</title>
+  <link rel="stylesheet" href="/graphiql-assets/graphiql.min.css"/>
+  <style>
+    body { margin: 0; height: 100vh; display: flex; flex-direction: column; }
+    #graphiql { flex: 1; }
+    .header {
+      background: #1a1a2e;
+      color: #e2e2e2;
+      padding: 8px 20px;
+      font-family: monospace;
+      font-size: 13px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    .header span { color: #4ecca3; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    🤖 <span>Multi-Agent GitHub Code Review</span> — GraphQL Explorer &nbsp;|&nbsp;
+    Endpoint: <code style="color:#ffd700">/graphql</code>
+  </div>
+  <div id="graphiql"></div>
+
+  <script src="/graphiql-assets/react.min.js"></script>
+  <script src="/graphiql-assets/react-dom.min.js"></script>
+  <script src="/graphiql-assets/graphiql.min.js"></script>
+  <script>
+    const root = ReactDOM.createRoot(document.getElementById('graphiql'));
+    root.render(
+      React.createElement(GraphiQL, {
+        fetcher: GraphiQL.createFetcher({ url: '/graphql' }),
+        defaultEditorToolsVisibility: true,
+        defaultQuery: `# Multi-Agent Code Review — GraphQL Explorer
+#
+# Try these queries:
+
+# 1. All pipeline runs
+query AllRuns {
+  allRuns {
+    id
+    repoUrl
+    branch
+    status
+    totalIssuesFound
+    totalIssuesFixed
+    totalFalsePositives
+    prUrl
+    startedAt
+    completedAt
+    findings {
+      filePath
+      lineNumber
+      issueType
+      severity
+      status
+      description
+      fixedCode
+      commitMessage
+      criticReasoning
+    }
+  }
+}
+
+# 2. Single run by ID
+# query SingleRun {
+#   pipelineRun(id: "paste-run-id-here") {
+#     id status totalIssuesFound prUrl
+#     findings { filePath severity status description }
+#   }
+# }
+`
+      })
+    );
+  </script>
+</body>
+</html>

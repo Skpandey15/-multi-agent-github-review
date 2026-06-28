@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+
+    <!-- ── Development profile: human-readable console ────────────────────── -->
+    <springProfile name="!prod">
+        <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+            <encoder>
+                <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level [corrId=%X{correlationId}] [wfId=%X{workflowId}] [runId=%X{runId}] %logger{36} - %msg%n</pattern>
+            </encoder>
+        </appender>
+        <root level="INFO">
+            <appender-ref ref="CONSOLE"/>
+        </root>
+    </springProfile>
+
+    <!-- ── Production profile: structured JSON (ECS format for ELK/Datadog) ─ -->
+    <springProfile name="prod">
+        <appender name="JSON_CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+            <encoder class="co.elastic.logging.logback.EcsEncoder">
+                <serviceName>multi-agent-github-review</serviceName>
+                <includeMarkers>true</includeMarkers>
+            </encoder>
+        </appender>
+        <root level="INFO">
+            <appender-ref ref="JSON_CONSOLE"/>
+        </root>
+    </springProfile>
+
+    <!-- ── Noise reduction ─────────────────────────────────────────────────── -->
+    <logger name="io.temporal"          level="WARN"/>
+    <logger name="dev.langchain4j"      level="WARN"/>
+    <logger name="org.hibernate"        level="WARN"/>
+    <logger name="com.zaxxer.hikari"    level="WARN"/>
+    <logger name="com.multiagent"       level="INFO"/>
+
+</configuration>

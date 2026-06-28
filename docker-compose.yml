@@ -1,0 +1,71 @@
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: github_review_postgres
+    environment:
+      POSTGRES_DB: github_review
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  temporal:
+    image: temporalio/auto-setup:1.25.1
+    container_name: github_review_temporal
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=postgres
+      - POSTGRES_PWD=postgres
+      - POSTGRES_SEEDS=postgres
+    ports:
+      - "7233:7233"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  temporal-ui:
+    image: temporalio/ui:2.26.2
+    container_name: github_review_temporal_ui
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:3000
+    ports:
+      - "8080:8080"
+    depends_on:
+      - temporal
+
+  app:
+    build: .
+    container_name: github_review_app
+    environment:
+      DB_HOST: postgres
+      DB_NAME: github_review
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      TEMPORAL_HOST: temporal
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET}
+      GMAIL_USERNAME: ${GMAIL_USERNAME}
+      GMAIL_APP_PASSWORD: ${GMAIL_APP_PASSWORD}
+      APP_EMAIL_FROM: ${GMAIL_USERNAME}
+      APP_EMAIL_TO: ${APP_EMAIL_TO}
+    ports:
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+
+volumes:
+  postgres_data:
