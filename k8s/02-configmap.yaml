@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: code-review-config
+  namespace: code-review
+data:
+  DB_HOST: "postgres"
+  DB_NAME: "github_review"
+  DB_USER: "postgres"
+  TEMPORAL_HOST: "temporal"
+  APP_EMAIL_TO: "skp4java@gmail.com"
+  APP_EMAIL_FROM: "noreply@codereview.ai"
+  SCHEDULER_ENABLED: "false"
